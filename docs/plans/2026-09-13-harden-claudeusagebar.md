@@ -59,6 +59,35 @@ git commit -m "docs: plan for hardening the fork before install"
 - Modify: `app/build.sh:73-88` (signing block), `app/build.sh:91-93` (auto-launch)
 - Create: `app/.gitignore`
 
+**Amended 2026-09-13 during execution — two blockers found that the plan missed:**
+
+1. **The CommandLineTools toolchain cannot build this app.** `xcode-select -p` points at
+   `/Library/Developer/CommandLineTools`, which ships no `libSwiftUIMacros.dylib`, so every
+   `@State` fails to expand: *"external macro implementation type 'SwiftUIMacros.StateMacro'
+   could not be found"* — 28 cascading errors. Fix: export
+   `DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"` in `build.sh`,
+   guard that the directory exists, and route both compiles through `xcrun swiftc`. Do **not**
+   run `sudo xcode-select -s` — that changes the machine's default toolchain globally.
+
+3. **`PlistBuddy` fabricates the file it was asked to edit.** Found while fixing (2): with
+   `cp Info.plist` neutered, the icon step's `PlistBuddy Add :CFBundleIconFile` created a fresh
+   one-key `Info.plist` from nothing — it logs `File Doesn't Exist, Will Create:` and exits 0.
+   That file is non-empty and `plutil -lint` reports it OK, so a `[ -s ... ]` + lint assertion
+   passes over a bundle with no `CFBundleExecutable` and no `CFBundleIdentifier`, which cannot
+   launch. The guard therefore checks for required *keys*, not just a well-formed file.
+   **Hazard to remember: anywhere this repo edits a plist by path, a missing file is silently
+   invented rather than reported.** Task 9 edits `Info.plist` with PlistBuddy — that task must
+   verify it is editing the real 13-key plist, not a stub of its own making.
+
+2. **`build.sh` could not fail.** It has no `set -e` and never checks `swiftc` or `lipo`. With
+   the compile fully failed and no executable produced, it still ad-hoc signed an app bundle
+   containing an empty `MacOS/` directory and printed `Build successful!`. **Step 4's original
+   acceptance criterion was therefore worthless, and so was every later task's.** Fix, committed
+   first so the rest is verified by a build script that can fail: check the exit status of both
+   `swiftc` calls and `lipo`, and assert `[ -s "$APP_PATH/Contents/MacOS/ClaudeUsageBar" ]`
+   before signing. Use explicit checks, not a blanket `set -e` — `dot_clean`, the two
+   `find ... -delete`, and the `PlistBuddy Add || Set` fallback all exit non-zero legitimately.
+
 **Step 1: Replace the signing block**
 
 Replace everything from `DEVELOPER_ID="Developer ID...` through the closing `fi` with:
@@ -94,13 +123,19 @@ EOF
 
 ```bash
 cd app && ./build.sh
+ls -l build/ClaudeUsageBar.app/Contents/MacOS/ClaudeUsageBar
+lipo -info build/ClaudeUsageBar.app/Contents/MacOS/ClaudeUsageBar
 ```
-Expected: `Build successful!` and `App bundle created at: build/ClaudeUsageBar.app`. Swift 6.4 may emit warnings from this Swift-5-era source; warnings are fine, errors are not.
+Expected: `Build successful!`, **and** a non-empty executable at that path reporting both
+`x86_64` and `arm64`. `Build successful!` on its own is not evidence — see the amendment above.
+Swift 6.4 may emit warnings from this Swift-5-era source; warnings are fine, errors are not.
 
 **Step 5: Commit**
 
+Two commits, the guards first:
+
 ```bash
-git add app/build.sh app/.gitignore
+git commit -m "build: fail loudly instead of signing an empty bundle"
 git commit -m "build: ad-hoc sign locally, don't auto-launch"
 ```
 
@@ -181,8 +216,11 @@ swiftc -o build/tests \
     tests/main.swift \
     -framework Foundation \
     -framework Security
-# Ad-hoc sign so the keychain sees a stable identity and doesn't prompt
-# on every run for items the binary created itself.
+# Ad-hoc sign the test binary. NOTE: this does NOT give it a stable identity
+# across rebuilds — an ad-hoc signature's designated requirement is the cdhash,
+# which changes every time the binary is recompiled. A keychain ACL therefore
+# sees each rebuild as a different application. The tests use their own service
+# name and delete what they create, so this costs correctness nothing.
 codesign --force --sign - build/tests
 ./build/tests
 ```
@@ -272,7 +310,16 @@ cd app && ./run-tests.sh
 ```
 Expected: eight `ok` lines and `All tests passed.`, exit 0. (`CookieSanitizer.swift` does not exist yet — create it empty for now with `touch CookieSanitizer.swift`, Task 4 fills it in.)
 
-**If macOS shows a keychain prompt:** allow it once. It appears because the ad-hoc signature changes on each rebuild, so the item's ACL no longer matches. If it becomes noisy during development, add `security delete-generic-password -s com.leffen.claudeusagebar.tests` before the run.
+**If macOS shows a keychain prompt:** allow it once, then carry on. Under an ad-hoc
+signature the cdhash changes with every rebuild, so a keychain ACL treats each build as a
+new application and may challenge it. This is expected and is not a `CredentialStore` bug —
+do not "fix" it by loosening `kSecAttrAccessible` or by widening the ACL.
+
+These prompts are modal dialogs that interrupt whoever is at the keyboard. **Do not run
+keychain probes in a loop, and do not treat a command that hangs for its full timeout as
+data — that is a human being asked for a password.** If prompts get noisy during
+development, `security delete-generic-password -s com.leffen.claudeusagebar.tests` between
+runs, and prefer a single verification at the end over repeated trials.
 
 **Step 5: Commit**
 
@@ -927,4 +974,8 @@ Worth stating so it is a decision rather than an oversight:
 - **The trust model is unchanged.** The app still holds a bearer credential for a Claude account. Hardening the storage narrows who can read it; it does not remove the credential from the machine.
 - **Upstream code is still upstream's.** We reviewed `a4c7784` and build from it. Any future `git pull` brings in code nobody has reviewed — re-read the diff before merging, particularly `UpdateManager` and anything touching `CredentialStore`.
 - **Work vs. personal account.** If the cookie comes from a Fjord Line Claude account, it is a corporate credential and the decision to put it in a third-party app belongs to whoever owns that policy, regardless of how well the app stores it. Use a personal account here unless that has been cleared.
+- **`app/create_dmg.sh` is knowingly left broken.** Line 70 still hardcodes the upstream
+  `Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)` and line 76 swallows the
+  failure with `2>/dev/null` and carries on. We never build a DMG — Task 10 installs by copying
+  the `.app` — so this is deliberate, not an oversight. Fix it before ever producing a DMG.
 - **Revocation.** Signing out of claude.ai everywhere is what invalidates the cookie. That, not deleting the app, is the response if this machine is ever suspect.
