@@ -6,12 +6,18 @@
 # That is a deliberate choice, not a necessity: `set -e` plus `|| true` on the
 # four legitimately best-effort lines (dot_clean, the two `find -delete`
 # cleanups, the PlistBuddy Add/Set fallback) would work too. Explicit checks are
-# preferred here because each one can say what actually broke, and because a
-# newly added line then fails loudly by default instead of being silently
-# covered by an `|| true` someone copied from the line above.
+# preferred here because each one can say what actually broke, which a blanket
+# `set -e` cannot.
+#
+# Know the cost of this style: an unchecked line fails SILENTLY. That is the
+# default here, and it is how an unchecked `cp Info.plist` once produced an
+# unlaunchable bundle under a "Build successful!". Several lines below
+# (mkdir -p, rm, > PkgInfo, chmod, xattr -cr) are still unchecked and are only
+# covered incidentally by the assertions before signing. Check what you add.
 #
 # No pipeline in this script currently depends on pipefail; it is set so that
-# one added later fails on its first component rather than its last.
+# one added later fails if any component fails, rather than reporting only the
+# status of the last.
 set -o pipefail
 
 echo "Building ClaudeUsageBar..."
@@ -123,6 +129,15 @@ for key in CFBundleExecutable CFBundleIdentifier CFBundlePackageType; do
         exit 1
     fi
 done
+
+# CFBundleExecutable must name the binary we actually built. codesign rejects a
+# mismatch anyway, so this is not a correctness gate -- it is here so the failure
+# reads as the naming mismatch it is, rather than as "signing failed".
+PLIST_EXEC="$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist" 2>/dev/null)"
+if [ "$PLIST_EXEC" != "ClaudeUsageBar" ]; then
+    echo "❌ CFBundleExecutable is '$PLIST_EXEC' but the built binary is 'ClaudeUsageBar'." >&2
+    exit 1
+fi
 
 # Ad-hoc signature. This build is for this machine only and is never
 # distributed, so there is no Developer ID and no notarization step.
