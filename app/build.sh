@@ -2,9 +2,16 @@
 
 # Build script for ClaudeUsageBar
 
-# Individual steps are checked explicitly rather than with a blanket `set -e`:
-# several lines below are legitimately best-effort (dot_clean, the `find -delete`
-# cleanups, the PlistBuddy Add/Set fallback) and a non-zero exit is normal there.
+# Steps are checked explicitly, one by one, rather than with a blanket `set -e`.
+# That is a deliberate choice, not a necessity: `set -e` plus `|| true` on the
+# four legitimately best-effort lines (dot_clean, the two `find -delete`
+# cleanups, the PlistBuddy Add/Set fallback) would work too. Explicit checks are
+# preferred here because each one can say what actually broke, and because a
+# newly added line then fails loudly by default instead of being silently
+# covered by an `|| true` someone copied from the line above.
+#
+# No pipeline in this script currently depends on pipefail; it is set so that
+# one added later fails on its first component rather than its last.
 set -o pipefail
 
 echo "Building ClaudeUsageBar..."
@@ -14,10 +21,18 @@ echo "Building ClaudeUsageBar..."
 # compiling against it fails with "external macro implementation type ...
 # could not be found". Route through Xcode's toolchain without changing the
 # machine's global xcode-select setting.
+# Test for the plugin itself, not just the directory: an exported DEVELOPER_DIR
+# pointing at CommandLineTools is a real directory but still cannot build this.
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+SWIFTUI_MACROS="$DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins/libSwiftUIMacros.dylib"
 if [ ! -d "$DEVELOPER_DIR" ]; then
     echo "❌ Xcode not found at $DEVELOPER_DIR" >&2
     echo "   Install Xcode, or set DEVELOPER_DIR to your Xcode.app/Contents/Developer." >&2
+    exit 1
+elif [ ! -f "$SWIFTUI_MACROS" ]; then
+    echo "❌ $DEVELOPER_DIR has no SwiftUI macro plugins (libSwiftUIMacros.dylib)." >&2
+    echo "   This is usually a CommandLineTools path; building needs a full Xcode." >&2
+    echo "   Set DEVELOPER_DIR to your Xcode.app/Contents/Developer and re-run." >&2
     exit 1
 fi
 
@@ -33,18 +48,19 @@ APP_PATH="build/$APP_NAME"
 mkdir -p "$APP_PATH/Contents/MacOS"
 mkdir -p "$APP_PATH/Contents/Resources"
 
-# Copy Info.plist
-cp Info.plist "$APP_PATH/Contents/"
+# Copy Info.plist. A bundle missing this still signs and verifies cleanly, but
+# macOS will not launch it -- so a silent failure here is invisible until install.
+cp Info.plist "$APP_PATH/Contents/" || { echo "❌ Failed to copy Info.plist" >&2; exit 1; }
 
 # Create icon if it doesn't exist
 if [ ! -f "ClaudeUsageBar.icns" ]; then
     echo "Creating app icon..."
-    ./make_app_icon.sh >/dev/null 2>&1
+    ./make_app_icon.sh >/dev/null || echo "⚠️  make_app_icon.sh failed; building without an app icon." >&2
 fi
 
 # Copy icon to Resources
 if [ -f "ClaudeUsageBar.icns" ]; then
-    cp ClaudeUsageBar.icns "$APP_PATH/Contents/Resources/"
+    cp ClaudeUsageBar.icns "$APP_PATH/Contents/Resources/" || { echo "❌ Failed to copy ClaudeUsageBar.icns" >&2; exit 1; }
     # Update Info.plist to reference icon
     /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string ClaudeUsageBar" "$APP_PATH/Contents/Info.plist" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile ClaudeUsageBar" "$APP_PATH/Contents/Info.plist"
@@ -94,11 +110,26 @@ if [ ! -s "$APP_PATH/Contents/MacOS/ClaudeUsageBar" ] || [ ! -x "$APP_PATH/Conte
     echo "❌ No executable in the bundle at $APP_PATH/Contents/MacOS/ClaudeUsageBar" >&2
     exit 1
 fi
+# Not just "a file exists and lints": PlistBuddy CREATES Info.plist when it is
+# absent, so a failed copy can leave a one-key plist that passes plutil -lint,
+# signs cleanly, and still cannot launch. Require the keys that make it a bundle.
+if [ ! -s "$APP_PATH/Contents/Info.plist" ] || ! plutil -lint "$APP_PATH/Contents/Info.plist" >/dev/null; then
+    echo "❌ Missing or malformed Info.plist at $APP_PATH/Contents/Info.plist" >&2
+    exit 1
+fi
+for key in CFBundleExecutable CFBundleIdentifier CFBundlePackageType; do
+    if ! /usr/libexec/PlistBuddy -c "Print :$key" "$APP_PATH/Contents/Info.plist" >/dev/null 2>&1; then
+        echo "❌ Info.plist is missing $key -- the bundle would not launch." >&2
+        exit 1
+    fi
+done
 
 # Ad-hoc signature. This build is for this machine only and is never
 # distributed, so there is no Developer ID and no notarization step.
-# --options runtime still enables the hardened runtime.
-if codesign --force --deep --options runtime --sign - "$APP_PATH"; then
+# --options runtime still enables the hardened runtime. No --deep: Apple
+# documents it as a verification/repair flag rather than a signing one, and
+# this bundle is a single flat executable with no nested code to recurse into.
+if codesign --force --options runtime --sign - "$APP_PATH"; then
     echo "✅ App ad-hoc signed"
     codesign --verify --verbose=2 "$APP_PATH" || { echo "❌ Signature verification failed" >&2; exit 1; }
 else
