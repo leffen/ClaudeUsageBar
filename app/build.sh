@@ -95,24 +95,16 @@ if [ ! -s "$APP_PATH/Contents/MacOS/ClaudeUsageBar" ] || [ ! -x "$APP_PATH/Conte
     exit 1
 fi
 
-# Sign with Developer ID certificate. NEVER silently fall back to ad-hoc — that
-# fails notarization later. If real signing fails, error out loudly.
-DEVELOPER_ID="Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)"
-if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH"; then
-    echo "✅ App signed with Developer ID"
-    if codesign --verify --verbose=2 "$APP_PATH" 2>&1 | grep -q "valid on disk"; then
-        echo "✅ Signature verified"
-    else
-        echo "❌ Signature verification failed — fix before shipping" >&2
-        exit 1
-    fi
+# Ad-hoc signature. This build is for this machine only and is never
+# distributed, so there is no Developer ID and no notarization step.
+# --options runtime still enables the hardened runtime.
+if codesign --force --deep --options runtime --sign - "$APP_PATH"; then
+    echo "✅ App ad-hoc signed"
+    codesign --verify --verbose=2 "$APP_PATH" || { echo "❌ Signature verification failed" >&2; exit 1; }
 else
-    echo "❌ Developer ID signing failed. NOT falling back to ad-hoc (would break notarization)." >&2
-    echo "   Fix the cause above (often: stale xattrs / ._files / cert not in keychain) and re-run." >&2
+    echo "❌ Ad-hoc signing failed" >&2
     exit 1
 fi
 
 echo "Build successful!"
 echo "App bundle created at: $APP_PATH"
-echo "Launching app..."
-open "$APP_PATH"
